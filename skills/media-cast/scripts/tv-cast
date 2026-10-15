@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TV Cast (tv-cast)
+轻量级本地 DLNA / UPnP 投屏工具
+支持一键发现局域网内的智能电视 / 投影仪，并将本地或网络音视频投屏播放。
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import socket
+import argparse
+import urllib.request
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import signal
+
+STATE_DIR = os.path.expanduser("~/.local/share/tv-cast")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+def get_local_ip(target_ip="192.168.1.1"):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target_ip, 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+def discover_dlna_devices(timeout=2.0):
+    """通过 SSDP 组播发现局域网中的 DLNA 渲染器 (电视、投影仪等)"""
+    SSDP_ADDR = "239.255.255.250"
+    SSDP_PORT = 1900
+    SSDP_MSG = (
+        'M-SEARCH * HTTP/1.1\r\n'
+        'HOST: 239.255.255.250:1900\r\n'
+        'MAN: "ssdp:discover"\r\n'
+        'MX: 2\r\n'
+        'ST: urn:schemas-upnp-org:service:AVTransport:1\r\n\r\n'
+    )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.settimeout(timeout)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    
+    locations = set()
+    try:
+        sock.sendto(SSDP_MSG.encode(), (SSDP_ADDR, SSDP_PORT))
+        while True:
+            try:
+                data, addr = sock.recvfrom(2048)
+                text = data.decode("utf-8", errors="ignore")
+                m = re.search(r'LOCATION:\s*(http://[^\r\n]+)', text, re.I)
+                if m:
+                    locations.add(m.group(1).strip())
+            except socket.timeout:
+                break
+    except Exception:
+        pass
+    finally:
+        sock.close()
+
+    devices = []
+    for loc in locations:
+        dev = parse_device_description(loc)
+        if dev:
+            devices.append(dev)
+    return devices
+
+def parse_device_description(loc_url):
+    try:
+        req = urllib.request.Request(loc_url, headers={"User-Agent": "DLNA-Client"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            xml = resp.read().decode("utf-8", errors="ignore")
+        
+        name_m = re.search(r'<friendlyName>([^<]+)</friendlyName>', xml)
+        friendly_name = name_m.group(1).strip() if name_m else "未知设备"
+
+        model_m = re.search(r'<modelName>([^<]+)</modelName>', xml)
+        model = model_m.group(1).strip() if model_m else ""
+
+        mfg_m = re.search(r'<manufacturer>([^<]+)</manufacturer>', xml)
+        mfg = mfg_m.group(1).strip() if mfg_m else ""
+
+        # 提取 AVTransport controlURL
+        av_m = re.search(r'<serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>.*?<controlURL>([^<]+)</controlURL>', xml, re.DOTALL)
+        if not av_m:
+            return None
+        control_sub = av_m.group(1).strip()
+
+        # 提取 RenderingControl (用于调音量)
+        rc_m = re.search(r'<serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>.*?<controlURL>([^<]+)</controlURL>', xml, re.DOTALL)
+        rc_sub = rc_m.group(1).strip() if rc_m else None
+
+        parsed_loc = urllib.parse.urlparse(loc_url)
+        base = f"{parsed_loc.scheme}://{parsed_loc.netloc}"
+
+        def full_url(sub):
+            if not sub: return None
+            if sub.startswith("http"): return sub
+            return base + ("/" + sub.lstrip("/"))
+
+        return {
+            "name": friendly_name,
+            "model": model,
+            "manufacturer": mfg,
+            "ip": parsed_loc.hostname,
+            "location": loc_url,
+            "av_control_url": full_url(control_sub),
+            "rc_control_url": full_url(rc_sub)
+        }
+    except Exception:
+        return None
+
+def send_soap(url, action, body_xml):
+    soap_env = f"""<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    {body_xml}
+  </s:Body>
+</s:Envelope>"""
+
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPAction": f'"urn:schemas-upnp-org:service:AVTransport:1#{action}"'
+    }
+    req = urllib.request.Request(url, data=soap_env.encode("utf-8"), headers=headers)
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+def make_didl(title, media_url):
+    escaped_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    escaped_url = media_url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    didl = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+  <item id="1" parentID="0" restricted="1">
+    <dc:title>{escaped_title}</dc:title>
+    <upnp:class>object.item.videoItem</upnp:class>
+    <res protocolInfo="http-get:*:video/mp4:*">{escaped_url}</res>
+  </item>
+</DIDL-Lite>"""
+    return didl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+class VideoFileServer(BaseHTTPRequestHandler):
+    """支持 HTTP 206 Partial Content (Range 请求) 的微型流媒体服务器"""
+    file_path = None
+
+    def log_message(self, format, *args):
+        pass  # 静默请求日志
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        if self.file_path and os.path.exists(self.file_path):
+            self.send_header("Content-Length", str(os.path.getsize(self.file_path)))
+        self.end_headers()
+
+    def do_GET(self):
+        if not self.file_path or not os.path.exists(self.file_path):
+            self.send_error(404, "File Not Found")
+            return
+
+        file_size = os.path.getsize(self.file_path)
+        range_header = self.headers.get("Range")
+
+        start = 0
+        end = file_size - 1
+
+        if range_header:
+            m = re.search(r'bytes=(\d+)-(\d*)', range_header)
+            if m:
+                start = int(m.group(1))
+                if m.group(2):
+                    end = int(m.group(2))
+
+        length = end - start + 1
+
+        if range_header:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        else:
+            self.send_response(200)
+
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+
+        with open(self.file_path, "rb") as f:
+            f.seek(start)
+            bytes_left = length
+            chunk_size = 64 * 1024
+            while bytes_left > 0:
+                read_size = min(chunk_size, bytes_left)
+                data = f.read(read_size)
+                if not data:
+                    break
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                bytes_left -= len(data)
+
+def start_http_daemon(file_path, port=8899):
+    VideoFileServer.file_path = file_path
+    server = HTTPServer(("0.0.0.0", port), VideoFileServer)
+    server.serve_forever()
+
+def cast_media(device, media_path_or_url, title=None):
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    # 停止之前的投屏服务（如果存在）
+    stop_current_cast(silent=True)
+
+    target_ip = device["ip"]
+    local_ip = get_local_ip(target_ip)
+
+    if os.path.exists(media_path_or_url):
+        abs_path = os.path.abspath(media_path_or_url)
+        video_title = title or os.path.splitext(os.path.basename(abs_path))[0]
+        port = 8899
+
+        # 在后台以独立进程启动视频流服务
+        pid = os.fork()
+        if pid == 0:
+            # 子进程
+            os.setsid()
+            start_http_daemon(abs_path, port)
+            sys.exit(0)
+
+        stream_url = f"http://{local_ip}:{port}/video.mp4"
+    else:
+        # 远程 URL
+        pid = None
+        stream_url = media_path_or_url
+        video_title = title or "在线视频"
+
+    av_url = device["av_control_url"]
+    didl = make_didl(video_title, stream_url)
+
+    # 1. SetAVTransportURI
+    body_set = f"""<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+  <CurrentURI>{stream_url}</CurrentURI>
+  <CurrentURIMetaData>{didl}</CurrentURIMetaData>
+</u:SetAVTransportURI>"""
+    send_soap(av_url, "SetAVTransportURI", body_set)
+
+    # 2. Play
+    body_play = """<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+  <Speed>1</Speed>
+</u:Play>"""
+    send_soap(av_url, "Play", body_play)
+
+    # 记录状态
+    state = {
+        "pid": pid,
+        "title": video_title,
+        "media": media_path_or_url,
+        "stream_url": stream_url,
+        "device": device,
+        "started_at": time.time()
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    return state
+
+def stop_current_cast(silent=False):
+    if not os.path.exists(STATE_FILE):
+        if not silent:
+            print("[!] 当前没有正在进行的投屏。")
+        return
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+        
+        # 停掉电视播放
+        av_url = state.get("device", {}).get("av_control_url")
+        if av_url:
+            try:
+                body_stop = """<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+</u:Stop>"""
+                send_soap(av_url, "Stop", body_stop)
+            except Exception:
+                pass
+
+        # 停掉本地流服务进程
+        pid = state.get("pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        if not silent:
+            print("[✔] 投屏已成功停止。")
+
+def pause_current_cast():
+    if not os.path.exists(STATE_FILE):
+        print("[!] 当前没有正在进行的投屏。")
+        return
+    with open(STATE_FILE, "r") as f:
+        state = json.load(f)
+    av_url = state.get("device", {}).get("av_control_url")
+    body = """<u:Pause xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+</u:Pause>"""
+    send_soap(av_url, "Pause", body)
+    print("[✔] 已暂停播放。")
+
+def resume_current_cast():
+    if not os.path.exists(STATE_FILE):
+        print("[!] 当前没有正在进行的投屏。")
+        return
+    with open(STATE_FILE, "r") as f:
+        state = json.load(f)
+    av_url = state.get("device", {}).get("av_control_url")
+    body = """<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+  <Speed>1</Speed>
+</u:Play>"""
+    send_soap(av_url, "Play", body)
+    print("[✔] 已恢复播放。")
+
+def get_cast_status():
+    if not os.path.exists(STATE_FILE):
+        print("[!] 当前没有处于活跃状态的投屏。")
+        return
+    with open(STATE_FILE, "r") as f:
+        state = json.load(f)
+
+    av_url = state.get("device", {}).get("av_control_url")
+    body = """<u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+</u:GetPositionInfo>"""
+    try:
+        resp = send_soap(av_url, "GetPositionInfo", body)
+        track_dur = re.search(r'<TrackDuration>([^<]+)</TrackDuration>', resp)
+        rel_time = re.search(r'<RelTime>([^<]+)</RelTime>', resp)
+        dur = track_dur.group(1) if track_dur else "未知"
+        pos = rel_time.group(1) if rel_time else "未知"
+    except Exception:
+        dur, pos = "未知", "未知"
+
+    print("==================================================")
+    print(f"📺 正在投屏: {state.get('title')}")
+    print(f"📡 目标设备: {state.get('device', {}).get('name')} ({state.get('device', {}).get('ip')})")
+    print(f"⏱️ 播放进度: {pos} / {dur}")
+    print("==================================================")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="TV Cast (tv-cast) - 局域网智能电视与投影仪投屏工具",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="示例:\n"
+               "  tv-cast -l                          # 扫描并列出局域网内可投屏的电视/投影仪\n"
+               "  tv-cast \"~/Downloads/希望.mp4\"       # 投屏指定视频（自动选中单设备）\n"
+               "  tv-cast \"~/Downloads/希望.mp4\" -d \"Kylin的电视\"  # 投屏到指定设备\n"
+               "  tv-cast --pause                     # 暂停播放\n"
+               "  tv-cast --resume                    # 恢复播放\n"
+               "  tv-cast --stop                      # 停止投屏并关闭服务\n"
+               "  tv-cast --status                    # 查看当前播放进度\n"
+    )
+    parser.add_argument("media", nargs="?", default=None, help="本地视频文件路径或网络媒体链接")
+    parser.add_argument("-l", "--list", action="store_true", help="扫描并展示局域网内的投屏设备")
+    parser.add_argument("-d", "--device", default=None, help="指定目标设备名称或 IP 地址")
+    parser.add_argument("--stop", action="store_true", help="停止当前投屏")
+    parser.add_argument("--pause", action="store_true", help="暂停当前播放")
+    parser.add_argument("--resume", action="store_true", help="恢复当前播放")
+    parser.add_argument("--status", action="store_true", help="查询当前投屏进度与状态")
+    parser.add_argument("--json", action="store_true", help="以 JSON 格式输出设备列表或投屏结果")
+
+    args = parser.parse_args()
+
+    if args.stop:
+        stop_current_cast()
+        return
+    if args.pause:
+        pause_current_cast()
+        return
+    if args.resume:
+        resume_current_cast()
+        return
+    if args.status:
+        get_cast_status()
+        return
+
+    # 扫描设备
+    if args.list or not args.media:
+        if not args.json:
+            print("[*] 正在扫描局域网内的 DLNA 电视 / 投影仪 (SSDP) ...")
+        devices = discover_dlna_devices()
+        if args.json:
+            print(json.dumps(devices, ensure_ascii=False, indent=2))
+            return
+
+        if not devices:
+            print("[!] 未在局域网内发现开启 DLNA 投屏的设备，请确保电视与 Mac 处于同一 Wi-Fi。")
+            return
+
+        print(f"\n==================================================")
+        print(f"📺 发现 {len(devices)} 台可用投屏设备:")
+        print(f"==================================================")
+        for idx, d in enumerate(devices, 1):
+            mfg_info = f" ({d['manufacturer']})" if d['manufacturer'] else ""
+            print(f"[{idx}] {d['name']}{mfg_info} - IP: {d['ip']}")
+        print(f"==================================================")
+        print("💡 提示: 投屏命令: tv-cast \"<视频路径>\" -d \"设备名称或IP\"\n")
+        return
+
+    # 投屏逻辑
+    media_path = os.path.expanduser(args.media)
+    if not os.path.exists(media_path) and not media_path.startswith("http"):
+        print(f"[✗] 文件不存在: {media_path}", file=sys.stderr)
+        sys.exit(1)
+
+    devices = discover_dlna_devices()
+    if not devices:
+        print("[✗] 未在局域网内搜索到可用的电视/投影仪设备。", file=sys.stderr)
+        sys.exit(1)
+
+    target_dev = None
+    if args.device:
+        for d in devices:
+            if args.device.lower() in d["name"].lower() or args.device == d["ip"]:
+                target_dev = d
+                break
+        if not target_dev:
+            print(f"[✗] 未找到匹配 '{args.device}' 的设备。可用设备:", file=sys.stderr)
+            for d in devices:
+                print(f"  - {d['name']} ({d['ip']})", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # 仅有 1 台设备时自动选中，多台时列出供选择
+        if len(devices) == 1:
+            target_dev = devices[0]
+        else:
+            print(f"[!] 发现多台设备，请使用 -d 指定目标设备:")
+            for d in devices:
+                print(f"  - {d['name']} ({d['ip']})")
+            sys.exit(1)
+
+    print(f"[*] 准备投屏到设备: {target_dev['name']} ({target_dev['ip']}) ...")
+    try:
+        state = cast_media(target_dev, media_path)
+        print(f"==================================================")
+        print(f"🎉 投屏指令已发送成功！")
+        print(f"🎬 播放片名: {state['title']}")
+        print(f"📺 目标大屏: {target_dev['name']}")
+        print(f"📡 串流地址: {state['stream_url']}")
+        print(f"==================================================")
+        print("💡 控制提示: 可以输入 `tv-cast --pause` 暂停，`tv-cast --stop` 退出投屏。")
+    except Exception as e:
+        print(f"[✗] 投屏失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

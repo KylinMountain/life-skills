@@ -10,9 +10,17 @@ mkdir -p "$BIN_DIR"
 mkdir -p "$SHARE_BIN_DIR"
 mkdir -p "$SKILLS_DIR"
 
-# 1. 安装 CLI
-cp "$REPO_DIR/skills/huavod-downloader/scripts/huavod-dl" "$BIN_DIR/huavod-dl"
-chmod +x "$BIN_DIR/huavod-dl"
+# 1. 安装 CLI 工具
+echo "Installing CLI utilities..."
+if [ -f "$REPO_DIR/skills/huavod-downloader/scripts/huavod-dl" ]; then
+    cp "$REPO_DIR/skills/huavod-downloader/scripts/huavod-dl" "$BIN_DIR/huavod-dl"
+    chmod +x "$BIN_DIR/huavod-dl"
+fi
+
+if [ -f "$REPO_DIR/skills/media-cast/scripts/tv-cast" ]; then
+    cp "$REPO_DIR/skills/media-cast/scripts/tv-cast" "$BIN_DIR/tv-cast"
+    chmod +x "$BIN_DIR/tv-cast"
+fi
 
 # 2. 检查依赖引擎
 ARCH="$(uname -m)"
@@ -45,4 +53,4 @@ for skill_dir in "$REPO_DIR"/skills/*; do
     fi
 done
 
-echo "Done! CLI tool 'huavod-dl' and skills installed."
+echo "Done! CLI tools (huavod-dl, tv-cast) and skills installed."

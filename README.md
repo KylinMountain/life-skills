@@ -4,12 +4,17 @@
 
 ---
 
-## 🛠️ 已包含工具
+## 🛠️ 已包含工具 & Skills
 
-- **`stream-downloader`（流媒体解析与本地缓存）**
-  - 支持特定 HLS/m3u8 视频流解析、分片多线程极速拉取与断点重试。
-  - 内置代理自动探测与调度，规避网络抖动。
-  - 下载完成后自动通过 FFmpeg 无损混流封装为标准 `.mp4`。
+### 1. `huavod-downloader`（流媒体解析与本地缓存）
+- 支持特定 HLS/m3u8 视频流解析、分片多线程极速拉取与断点重试。
+- 内置代理自动探测与调度，规避网络抖动。
+- 下载完成后自动通过 FFmpeg 无损混流封装为标准 `.mp4`。
+
+### 2. `media-cast`（局域网电视 / 投影仪智能投屏）
+- 基于标准 DLNA / UPnP 协议，自动发现局域网内的智能电视（小米、索尼、海信、TCL等）与投影仪（极米、当贝等）。
+- 本地启动轻量级支持 HTTP Range 的视频流媒体服务，实现电视端随意拖动进度、秒级缓冲与大屏硬解播放。
+- 支持暂停、恢复、停止与播放进度查询。
 
 ---
 
@@ -22,6 +27,8 @@ cd life-skills && ./install.sh
 ```
 
 ### 2. 命令行使用
+
+#### 影视搜索与离线下载 (`huavod-dl`)
 ```bash
 # 搜索资源
 huavod-dl "<关键词>"
@@ -36,18 +43,34 @@ huavod-dl "<剧集链接>" --ep 1-5
 huavod-dl "<视频链接>" --info
 ```
 
+#### 局域网大屏投屏 (`tv-cast`)
+```bash
+# 扫描局域网内的可用电视与投影仪
+tv-cast -l
+
+# 一键投屏指定视频（单设备自动选中）
+tv-cast "~/Downloads/希望.mp4"
+
+# 投屏到指定设备（如存在多台设备时）
+tv-cast "~/Downloads/希望.mp4" -d "Kylin的电视"
+
+# 控制播放状态
+tv-cast --pause    # 暂停
+tv-cast --resume   # 恢复
+tv-cast --status   # 查看进度
+tv-cast --stop     # 停止投屏
+```
+
 ---
 
 ## 📂 仓库结构
 
 ```text
 life-skills/
-├── skills/          # AI 智能体技能模块（适配通用 Agent Skills 规范）
-│   └── huavod-downloader/
-│       ├── SKILL.md
-│       └── scripts/
-│           └── huavod-dl
-├── install.sh       # 环境初始化与依赖配置脚本
+├── skills/
+│   ├── huavod-downloader/  # 视频流解析与下载 Skill
+│   └── media-cast/         # 局域网智能投屏 Skill
+├── install.sh              # 环境初始化与依赖配置脚本
 └── README.md
 ```
 
