@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary & Download files
+*.ts
+*.mp4
+*.m3u8
+*.log
+.huavod_tmp/
+huavod_tmp_*/
+huavod_cookie_*
+
+# OS metadata
+.DS_Store
+Thumbs.db

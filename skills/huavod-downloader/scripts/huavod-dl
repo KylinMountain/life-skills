@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+HuaVod Downloader (huavod-dl)
+华视影院 / 华影网 (huavod.com) 专属高清视频/剧集自动化搜索、解析与下载工具
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import socket
+import argparse
+import tempfile
+import subprocess
+import urllib.parse
+
+BIN_DIR = os.path.expanduser("~/.local/share/huavod-dl/bin")
+DEFAULT_FFMPEG = os.path.join(BIN_DIR, "ffmpeg")
+DEFAULT_N_M3U8DL = os.path.join(BIN_DIR, "N_m3u8DL-RE")
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Downloads")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+def detect_proxy(custom_proxy=None):
+    """自动探测本机可用代理（Clash / 环境变量等），加速 Cloudflare 握手"""
+    if custom_proxy:
+        return custom_proxy
+
+    candidates = [
+        os.environ.get("https_proxy"),
+        os.environ.get("http_proxy"),
+        os.environ.get("all_proxy"),
+        "http://127.0.0.1:7890",
+        "http://127.0.0.1:7897"
+    ]
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(p if "://" in p else f"http://{p}")
+            s = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=0.3)
+            s.close()
+            return p
+        except Exception:
+            continue
+    return None
+
+class HuaVodClient:
+    def __init__(self, base_url="https://huavod.com", proxy=None):
+        self.base_url = base_url.rstrip("/")
+        self.proxy = proxy
+        self.cookie_file = tempfile.mktemp(prefix="huavod_cookie_")
+
+    def __del__(self):
+        try:
+            if os.path.exists(self.cookie_file):
+                os.remove(self.cookie_file)
+        except Exception:
+            pass
+
+    def _curl(self, url, data_dict=None, referer=None, timeout=25):
+        if not url.startswith("http"):
+            url = self.base_url + ("/" + url.lstrip("/"))
+
+        cmd = [
+            "curl", "-s", "-L", "--compressed",
+            "-m", str(timeout),
+            "--retry", "2",
+            "-A", USER_AGENT,
+            "-b", self.cookie_file,
+            "-c", self.cookie_file,
+            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+            "-H", "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8"
+        ]
+        if self.proxy:
+            cmd += ["-x", self.proxy]
+        if referer:
+            cmd += ["-H", f"Referer: {referer}"]
+
+        if data_dict:
+            encoded_data = urllib.parse.urlencode(data_dict)
+            cmd += [
+                "-X", "POST",
+                "-H", "Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
+                "-H", "X-Requested-With: XMLHttpRequest",
+                "-d", encoded_data
+            ]
+
+        cmd.append(url)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"请求失败 (curl exit {res.returncode}): {res.stderr.strip()}")
+        return res.stdout
+
+    def search(self, keyword):
+        """搜索影视内容，返回匹配的项目列表"""
+        encoded_wd = urllib.parse.quote(keyword)
+        url = f"{self.base_url}/vodsearch.html?wd={encoded_wd}"
+        html = self._curl(url, referer=f"{self.base_url}/")
+
+        items = []
+        blocks = re.split(r'<div class=\"(?:vod-list-box|search-box|row-right|left public-list-bj)', html)
+        for b in blocks[1:]:
+            m_id = re.search(r'href=\"/voddetail/(\d+)\.html\"', b)
+            if not m_id:
+                continue
+            vid = m_id.group(1)
+
+            m_title = re.search(r'<div class=\"thumb-txt[^\"]*\"><a[^>]*>([^<]+)</a>', b)
+            title = m_title.group(1).strip() if m_title else ''
+            if not title:
+                continue
+
+            m_prb = re.search(r'<span class=\"public-list-prb[^\"]*\">([^<]*)</span>', b)
+            status = m_prb.group(1).strip() if m_prb else ''
+
+            m_else = re.search(r'<div class=\"thumb-else[^\"]*\">(.*?)</div>', b, re.DOTALL)
+            meta_tags = [t.strip() for t in re.findall(r'<a[^>]*>([^<]+)</a>', m_else.group(1))] if m_else else []
+
+            m_act = re.search(r'<div class=\"thumb-actor[^\"]*\">(.*?)</div>', b, re.DOTALL)
+            actors = [a.strip() for a in re.findall(r'<a[^>]*>([^<]+)</a>', m_act.group(1)) if a.strip() != '主演：'] if m_act else []
+
+            items.append({
+                'id': vid,
+                'title': title,
+                'status': status,
+                'tags': meta_tags,
+                'actors': actors,
+                'url': f"{self.base_url}/voddetail/{vid}.html"
+            })
+        return items
+
+    def parse_url(self, raw_input):
+        raw_input = raw_input.strip()
+        m_play = re.search(r'/vodplay/(\d+)-(\d+)-(\d+)', raw_input)
+        if m_play:
+            return {
+                "type": "play",
+                "id": m_play.group(1),
+                "sid": m_play.group(2),
+                "nid": m_play.group(3),
+                "episode": f"{m_play.group(1)}-{m_play.group(2)}-{m_play.group(3)}"
+            }
+        
+        m_detail = re.search(r'/voddetail/(\d+)', raw_input)
+        if m_detail:
+            return {
+                "type": "detail",
+                "id": m_detail.group(1)
+            }
+
+        if re.match(r'^\d+-\d+-\d+$', raw_input):
+            parts = raw_input.split('-')
+            return {
+                "type": "play",
+                "id": parts[0],
+                "sid": parts[1],
+                "nid": parts[2],
+                "episode": raw_input
+            }
+        if re.match(r'^\d+$', raw_input):
+            return {
+                "type": "detail",
+                "id": raw_input
+            }
+
+        # Otherwise treat as search keyword
+        return {
+            "type": "search",
+            "keyword": raw_input
+        }
+
+    def get_detail_info(self, vod_id):
+        url = f"{self.base_url}/voddetail/{vod_id}.html"
+        html = self._curl(url)
+
+        title_m = re.search(r'<h1[^>]*>([^<]+)</h1>', html) or re.search(r'<title>([^<]+)</title>', html)
+        raw_title = title_m.group(1).strip() if title_m else f"video_{vod_id}"
+        clean_title = re.sub(r'详情介绍|在线观看|免费在线播放|电视剧.*|全集.*', '', raw_title).strip()
+
+        ep_matches = re.findall(rf'href="(/vodplay/{vod_id}-(\d+)-(\d+)\.html)"[^>]*>([^<]+)</a>', html)
+        seen = set()
+        episodes = []
+        for href, sid, nid, ep_name in ep_matches:
+            key = (sid, nid)
+            if key not in seen:
+                seen.add(key)
+                episodes.append({
+                    "href": href,
+                    "sid": sid,
+                    "nid": nid,
+                    "ep_name": ep_name.strip(),
+                    "episode": f"{vod_id}-{sid}-{nid}"
+                })
+
+        return {
+            "id": vod_id,
+            "title": clean_title or f"video_{vod_id}",
+            "episodes": episodes
+        }
+
+    def resolve_stream(self, episode_param, quiet=False):
+        player_page_url = f"{self.base_url}/Player/ec?episode={episode_param}"
+        referer = f"{self.base_url}/vodplay/{episode_param}.html"
+
+        if not quiet:
+            print(f"[*] 正在获取播放参数: {player_page_url} ...")
+
+        html = self._curl(player_page_url, referer=referer)
+
+        cfg_m = re.search(r'let\s+ConFig\s*=\s*(\{.*?\})\s*,\s*box\s*=', html, re.DOTALL)
+        if not cfg_m:
+            raise RuntimeError("未能提取到播放器配置 ConFig，网站可能变动或当前页面无播放源")
+
+        cfg_json = json.loads(cfg_m.group(1))
+        mt = cfg_json.get("mt")
+        if not mt:
+            raise RuntimeError("播放器未返回 mt 令牌，可能无有效播放源或需登录会员")
+
+        ad_ms = int(cfg_json.get("ad_duration_ms", 22000))
+        mes_data = cfg_json.get("MesData", {})
+        video_name = mes_data.get("name", episode_param)
+
+        wait_seconds = max(1, (ad_ms - 1500) // 1000)
+
+        if not quiet:
+            print(f"[*] 识别到片名: {video_name}")
+            print(f"[*] 网站存在防广告倒计时验证，需要等待约 {wait_seconds} 秒以换取真播放源...")
+
+        for remaining in range(wait_seconds, 0, -1):
+            if not quiet:
+                print(f"\r[⏳] 正在等待服务端计时验证... 倒计时剩余 {remaining:2d} 秒", end="", flush=True)
+            time.sleep(1)
+
+        if not quiet:
+            print("\r[✔] 计时验证完成，正在向服务端请求真实视频流清单...      ", flush=True)
+
+        resolve_res_str = self._curl(
+            f"{self.base_url}/Player/resolveUrl",
+            data_dict={"token": mt},
+            referer=player_page_url
+        )
+
+        try:
+            res_obj = json.loads(resolve_res_str)
+        except Exception as e:
+            raise RuntimeError(f"解析服务端响应失败: {resolve_res_str} ({e})")
+
+        if res_obj.get("code") != 1:
+            msg = res_obj.get("msg", "未知错误")
+            raise RuntimeError(f"服务端拒绝生成播放链接: {msg}")
+
+        m3u8_url = res_obj.get("data", {}).get("url")
+        if not m3u8_url:
+            raise RuntimeError(f"未在响应中找到有效的 m3u8 URL: {res_obj}")
+
+        return {
+            "name": video_name,
+            "episode": episode_param,
+            "m3u8_url": m3u8_url
+        }
+
+def clean_save_name(raw_name):
+    name = re.sub(r'[\/:*?"<>|]', '_', raw_name)
+    name = re.sub(r'在线观看|免费观看|蓝光高清|超清|高清', '', name)
+    name = name.strip(' -_')
+    return name or "video"
+
+def download_stream(m3u8_url, save_name, output_dir, threads=16, proxy=None):
+    os.makedirs(output_dir, exist_ok=True)
+    temp_dir = os.path.join("/tmp", f"huavod_tmp_{os.getpid()}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    final_mp4 = os.path.join(output_dir, f"{save_name}.mp4")
+    if os.path.exists(final_mp4):
+        print(f"[!] 目标文件已存在: {final_mp4}，跳过下载。")
+        return final_mp4
+
+    cmd = [
+        DEFAULT_N_M3U8DL,
+        m3u8_url,
+        "--save-dir", output_dir,
+        "--save-name", save_name,
+        "--tmp-dir", temp_dir,
+        "-M", f"format=mp4:bin_path={DEFAULT_FFMPEG}",
+        "--auto-select",
+        "--thread-count", str(threads),
+        "--download-retry-count", "10",
+        "--http-request-timeout", "25",
+        "--del-after-done",
+        "-H", "Referer: https://huavod.com/",
+        "-H", f"User-Agent: {USER_AGENT}"
+    ]
+    if proxy:
+        cmd += ["--custom-proxy", proxy]
+
+    print(f"[*] 启动 N_m3u8DL-RE 引擎下载中（{threads} 线程并发）...")
+    ret = subprocess.run(cmd)
+    if ret.returncode != 0:
+        raise RuntimeError(f"下载失败，N_m3u8DL-RE 退出码: {ret.returncode}")
+
+    if os.path.exists(final_mp4):
+        size_mb = os.path.getsize(final_mp4) / (1024 * 1024)
+        print(f"\n[✔] 恭喜！下载完成: {final_mp4} (大小: {size_mb:.2f} MB)")
+        return final_mp4
+    else:
+        print(f"\n[✔] 下载与混流处理完毕。")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="HuaVod.com (华影/华视影院) 专属高清视频/剧集搜索与下载器",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="示例:\n"
+               "  huavod-dl \"凡人修仙传\"                               # 搜索影视并展示结果\n"
+               "  huavod-dl \"https://huavod.com/vodplay/202979-1-1.html\" # 直接下载单片\n"
+               "  huavod-dl \"https://huavod.com/voddetail/203704.html\" --ep 1\n"
+               "  huavod-dl \"https://huavod.com/voddetail/203704.html\" --ep all\n"
+               "  huavod-dl -s \"凡人修仙传\" --json                     # 搜索并输出JSON\n"
+    )
+    parser.add_argument("target", nargs="?", default=None, help="视频播放页、详情页链接、影片 ID，或搜索关键词")
+    parser.add_argument("-s", "--search", default=None, help="搜索指定影视关键词")
+    parser.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"保存目录 (默认: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("-t", "--threads", type=int, default=16, help="并发下载线程数 (默认: 16)")
+    parser.add_argument("-e", "--ep", default=None, help="剧集选择: '1', '1-5', '1,3,5', 或 'all' (仅当传入详情页时生效)")
+    parser.add_argument("-p", "--proxy", default=None, help="指定 HTTP/SOCKS 代理 (留空则自动检测 Clash 等代理)")
+    parser.add_argument("--info", action="store_true", help="仅解析并打印 m3u8 流地址和元数据，不执行下载")
+    parser.add_argument("--json", action="store_true", help="以标准 JSON 格式输出结果")
+
+    args = parser.parse_args()
+
+    active_proxy = detect_proxy(args.proxy)
+    if active_proxy and not args.json:
+        print(f"[🌐] 已启用网络加速代理: {active_proxy}")
+
+    client = HuaVodClient(proxy=active_proxy)
+
+    # 1. 显式指定搜索或未输入参数
+    search_keyword = args.search
+    if not search_keyword and args.target:
+        parsed_try = client.parse_url(args.target)
+        if parsed_try["type"] == "search":
+            search_keyword = parsed_try["keyword"]
+    elif not search_keyword and not args.target:
+        parser.print_help()
+        sys.exit(0)
+
+    # 2. 搜索分支
+    if search_keyword:
+        if not args.json:
+            print(f"[*] 正在华视影院检索关键词: '{search_keyword}' ...")
+        results = client.search(search_keyword)
+        if args.json:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+            return
+
+        if not results:
+            print(f"[!] 未找到与 '{search_keyword}' 相关的影视资源。")
+            return
+
+        print(f"==================================================")
+        print(f"🔍 搜索关键词: {search_keyword} (找到 {len(results)} 个结果)")
+        print(f"==================================================")
+        for idx, item in enumerate(results, 1):
+            tag_str = " / ".join(item['tags']) if item['tags'] else "暂无分类"
+            actor_str = ", ".join(item['actors'][:4]) if item['actors'] else "未知"
+            status_str = f"[{item['status']}]" if item['status'] else ""
+            print(f"\n[{idx}] {item['title']} {status_str}")
+            print(f"    🎬 类型/年份: {tag_str}")
+            print(f"    👥 主演: {actor_str}")
+            print(f"    🔗 详情链接: {item['url']}")
+            print(f"    💡 下载命令: huavod-dl \"{item['url']}\" --ep 1")
+        print("\n" + "="*50)
+        return
+
+    # 3. 播放或详情链接处理
+    try:
+        parsed = client.parse_url(args.target)
+    except Exception as e:
+        print(f"[✗] 解析失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 详情页处理
+    if parsed["type"] == "detail":
+        detail = client.get_detail_info(parsed["id"])
+        episodes = detail.get("episodes", [])
+        if not episodes:
+            print(f"[!] 未在该详情页找到任何播放选集，可能影片已下架", file=sys.stderr)
+            sys.exit(1)
+
+        if not args.json:
+            print(f"==================================================")
+            print(f"🎬 影视名称: {detail['title']}")
+            print(f"📺 共检索到 {len(episodes)} 个播放集数")
+            print(f"==================================================")
+
+        selected_eps = []
+        if args.ep:
+            if args.ep.lower() == "all":
+                selected_eps = episodes
+            else:
+                wanted_indices = set()
+                parts = args.ep.split(',')
+                for part in parts:
+                    if '-' in part:
+                        start, end = part.split('-', 1)
+                        for i in range(int(start), int(end) + 1):
+                            wanted_indices.add(i)
+                    else:
+                        wanted_indices.add(int(part))
+                for ep in episodes:
+                    try:
+                        n = int(ep["nid"])
+                        if n in wanted_indices:
+                            selected_eps.append(ep)
+                    except ValueError:
+                        pass
+        else:
+            if len(episodes) == 1:
+                selected_eps = episodes
+            else:
+                print("可用集数列表:")
+                for ep in episodes[:20]:
+                    print(f"  [集数 {ep['nid']}] {ep['ep_name']}")
+                if len(episodes) > 20:
+                    print(f"  ... 以及其他 {len(episodes) - 20} 集")
+                print("\n[💡] 提示: 这是一个多集剧集，请使用 --ep 指定要下载的集数，例如:")
+                print(f"  huavod-dl \"{args.target}\" --ep 1       # 仅下载第 1 集")
+                print(f"  huavod-dl \"{args.target}\" --ep 1-3     # 下载第 1 到 3 集")
+                print(f"  huavod-dl \"{args.target}\" --ep all     # 下载全部剧集")
+                sys.exit(0)
+
+        results = []
+        for idx, ep in enumerate(selected_eps, 1):
+            if not args.json:
+                print(f"\n[{idx}/{len(selected_eps)}] 准备下载: {detail['title']} - {ep['ep_name']}")
+            try:
+                res = client.resolve_stream(ep["episode"], quiet=args.json)
+                if args.info or args.json:
+                    results.append(res)
+                    if not args.json:
+                        print(f"M3U8 流地址: {res['m3u8_url']}")
+                    continue
+                safe_name = clean_save_name(f"{detail['title']} - {ep['ep_name']}")
+                download_stream(res["m3u8_url"], safe_name, args.output_dir, threads=args.threads, proxy=active_proxy)
+            except Exception as e:
+                print(f"[✗] 第 {ep['ep_name']} 集下载失败: {e}", file=sys.stderr)
+
+        if args.json:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+
+    # 单个播放页处理
+    elif parsed["type"] == "play":
+        try:
+            res = client.resolve_stream(parsed["episode"], quiet=args.json)
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                return
+            if args.info:
+                print(f"影片名称: {res['name']}")
+                print(f"M3U8 地址: {res['m3u8_url']}")
+                return
+
+            safe_name = clean_save_name(res["name"])
+            download_stream(res["m3u8_url"], safe_name, args.output_dir, threads=args.threads, proxy=active_proxy)
+        except Exception as e:
+            print(f"[✗] 处理失败: {e}", file=sys.stderr)
+            sys.exit(1)
+
+if __name__ == '__main__':
+    main()
