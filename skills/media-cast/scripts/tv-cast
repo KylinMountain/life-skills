@@ -16,10 +16,13 @@ import socket
 import argparse
 import urllib.request
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 import signal
 import subprocess
+import shutil
+import tempfile
+import html
 
 STATE_DIR = os.path.expanduser("~/.local/share/tv-cast")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -135,34 +138,60 @@ def send_soap(url, action, body_xml):
     with urllib.request.urlopen(req, timeout=4) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
-def make_didl(title, media_url):
-    escaped_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    escaped_url = media_url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    didl = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
-  <item id="1" parentID="0" restricted="1">
-    <dc:title>{escaped_title}</dc:title>
-    <upnp:class>object.item.videoItem</upnp:class>
-    <res protocolInfo="http-get:*:video/mp4:*">{escaped_url}</res>
-  </item>
-</DIDL-Lite>"""
-    return didl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+def make_didl(title, media_url, file_size=None):
+    clean_title = html.escape(title, quote=False)
+    clean_url = html.escape(media_url, quote=False)
+    size_attr = f' size="{file_size}"' if file_size else ''
+    raw_didl = (
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        f'<item id="1" parentID="0" restricted="1">'
+        f'<dc:title>{clean_title}</dc:title>'
+        f'<upnp:class>object.item.videoItem</upnp:class>'
+        f'<res{size_attr} protocolInfo="http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000">{clean_url}</res>'
+        f'</item>'
+        '</DIDL-Lite>'
+    )
+    return html.escape(raw_didl, quote=True)
 
 class VideoFileServer(BaseHTTPRequestHandler):
-    """支持 HTTP 206 Partial Content (Range 请求) 的微型流媒体服务器"""
+    """支持多线程并发、完整 RFC 7233 Range 与 DLNA 头部的微型流媒体服务器"""
     file_path = None
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
-        pass  # 静默请求日志
+        try:
+            with open("/tmp/tv-cast.log", "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_address[0]} - {format % args}\n")
+        except Exception:
+            pass
 
     def do_HEAD(self):
+        try:
+            with open("/tmp/tv-cast.log", "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] HEAD from {self.client_address[0]} UA: {self.headers.get('User-Agent')}\n")
+        except Exception:
+            pass
+        if not self.file_path or not os.path.exists(self.file_path):
+            self.send_error(404, "File Not Found")
+            return
+        file_size = os.path.getsize(self.file_path)
         self.send_response(200)
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Accept-Ranges", "bytes")
-        if self.file_path and os.path.exists(self.file_path):
-            self.send_header("Content-Length", str(os.path.getsize(self.file_path)))
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
 
     def do_GET(self):
+        try:
+            with open("/tmp/tv-cast.log", "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] GET Range: {self.headers.get('Range')} UA: {self.headers.get('User-Agent')}\n")
+        except Exception:
+            pass
         if not self.file_path or not os.path.exists(self.file_path):
             self.send_error(404, "File Not Found")
             return
@@ -170,48 +199,127 @@ class VideoFileServer(BaseHTTPRequestHandler):
         file_size = os.path.getsize(self.file_path)
         range_header = self.headers.get("Range")
 
+        is_range = False
         start = 0
         end = file_size - 1
 
-        if range_header:
-            m = re.search(r'bytes=(\d+)-(\d*)', range_header)
-            if m:
-                start = int(m.group(1))
-                if m.group(2):
-                    end = int(m.group(2))
+        if range_header and range_header.startswith("bytes="):
+            val = range_header.split("=", 1)[1].strip()
+            # 1. 后缀范围：Range: bytes=-524288 (用于获取 MP4 尾部 moov atom)
+            m_suffix = re.match(r'^-(\d+)$', val)
+            if m_suffix:
+                suffix_len = int(m_suffix.group(1))
+                if suffix_len <= 0:
+                    self.send_error(416, "Range Not Satisfiable")
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                start = max(0, file_size - suffix_len)
+                end = file_size - 1
+                is_range = True
+            else:
+                # 2. 标准范围：Range: bytes=0-1024 或 bytes=1024-
+                m_range = re.match(r'^(\d+)-(\d*)$', val)
+                if m_range:
+                    start = int(m_range.group(1))
+                    if m_range.group(2):
+                        end = int(m_range.group(2))
+                    if start > end or start >= file_size:
+                        self.send_error(416, "Range Not Satisfiable")
+                        self.send_header("Content-Range", f"bytes */{file_size}")
+                        self.end_headers()
+                        return
+                    end = min(end, file_size - 1)
+                    is_range = True
 
         length = end - start + 1
 
-        if range_header:
-            self.send_response(206)
+        if is_range:
+            self.send_response(206, "Partial Content")
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         else:
-            self.send_response(200)
+            self.send_response(200, "OK")
 
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        with open(self.file_path, "rb") as f:
-            f.seek(start)
-            bytes_left = length
-            chunk_size = 64 * 1024
-            while bytes_left > 0:
-                read_size = min(chunk_size, bytes_left)
-                data = f.read(read_size)
-                if not data:
-                    break
-                try:
+        sent = 0
+        err = None
+        try:
+            with open(self.file_path, "rb") as f:
+                f.seek(start)
+                bytes_left = length
+                chunk_size = 128 * 1024
+                while bytes_left > 0:
+                    read_size = min(chunk_size, bytes_left)
+                    data = f.read(read_size)
+                    if not data:
+                        break
                     self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
-                    break
-                bytes_left -= len(data)
+                    bytes_left -= len(data)
+                    sent += len(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.error) as e:
+            err = e
+        try:
+            with open("/tmp/tv-cast.log", "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished GET. Sent {sent}/{length} bytes. Err: {err}\n")
+        except Exception:
+            pass
+
+class CastHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 def start_http_daemon(file_path, port=8899):
     VideoFileServer.file_path = file_path
-    server = HTTPServer(("0.0.0.0", port), VideoFileServer)
+    server = CastHTTPServer(("0.0.0.0", port), VideoFileServer)
     server.serve_forever()
+
+def ensure_faststart(filepath):
+    """检测并在必要时将 MP4 moov atom 移动到文件头部，实现秒开播放"""
+    if not os.path.exists(filepath) or not filepath.lower().endswith(".mp4"):
+        return filepath
+
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(65536)
+            pos_moov = chunk.find(b"moov")
+            pos_mdat = chunk.find(b"mdat")
+            if pos_moov != -1 and (pos_mdat == -1 or pos_moov < pos_mdat):
+                return filepath  # 已经处于 faststart 状态
+    except Exception:
+        return filepath
+
+    ffmpeg_bin = os.path.expanduser("~/.local/share/huavod-dl/bin/ffmpeg")
+    if not os.path.isfile(ffmpeg_bin) or not os.access(ffmpeg_bin, os.X_OK):
+        ffmpeg_bin = shutil.which("ffmpeg")
+
+    if not ffmpeg_bin:
+        return filepath
+
+    print("[*] 正在优化视频索引结构 (MP4 faststart 秒播转封装)...")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"faststart_{os.getpid()}_{os.path.basename(filepath)}")
+    try:
+        cmd = [ffmpeg_bin, "-y", "-i", filepath, "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_path]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            shutil.copy2(tmp_path, filepath)
+            print("[✔] 视频快速播放优化完成。")
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    return filepath
 
 def cast_media(device, media_path_or_url, title=None):
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -221,13 +329,16 @@ def cast_media(device, media_path_or_url, title=None):
 
     target_ip = device["ip"]
     local_ip = get_local_ip(target_ip)
+    file_size = None
 
     if os.path.exists(media_path_or_url):
         abs_path = os.path.abspath(media_path_or_url)
+        ensure_faststart(abs_path)
+        file_size = os.path.getsize(abs_path)
         video_title = title or os.path.splitext(os.path.basename(abs_path))[0]
         port = 8899
 
-        # 在后台以独立进程启动流媒体服务 (跨平台兼容 macOS/Linux/Windows)
+        # 在后台以独立进程启动多线程流媒体服务 (跨平台兼容 macOS/Linux/Windows)
         server_cmd = [
             sys.executable,
             os.path.abspath(__file__),
@@ -249,7 +360,18 @@ def cast_media(device, media_path_or_url, title=None):
         video_title = title or "在线视频"
 
     av_url = device["av_control_url"]
-    didl = make_didl(video_title, stream_url)
+
+    # 0. 尝试重置设备播放器状态 (防止电视处于残留挂起状态)
+    try:
+        body_stop = """<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+</u:Stop>"""
+        send_soap(av_url, "Stop", body_stop)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    didl = make_didl(video_title, stream_url, file_size=file_size)
 
     # 1. SetAVTransportURI
     body_set = f"""<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
@@ -258,6 +380,8 @@ def cast_media(device, media_path_or_url, title=None):
   <CurrentURIMetaData>{didl}</CurrentURIMetaData>
 </u:SetAVTransportURI>"""
     send_soap(av_url, "SetAVTransportURI", body_set)
+
+    time.sleep(0.3)
 
     # 2. Play
     body_play = """<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
@@ -351,21 +475,43 @@ def get_cast_status():
         state = json.load(f)
 
     av_url = state.get("device", {}).get("av_control_url")
-    body = """<u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+    play_state = "未知"
+    dur = "未知"
+    pos = "未知"
+
+    try:
+        # 查询播放器运行状态
+        body_state = """<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <InstanceID>0</InstanceID>
+</u:GetTransportInfo>"""
+        resp_state = send_soap(av_url, "GetTransportInfo", body_state)
+        state_m = re.search(r'<CurrentTransportState>([^<]+)</CurrentTransportState>', resp_state)
+        if state_m:
+            play_state = state_m.group(1)
+
+        # 查询播放进度
+        body = """<u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
   <InstanceID>0</InstanceID>
 </u:GetPositionInfo>"""
-    try:
         resp = send_soap(av_url, "GetPositionInfo", body)
         track_dur = re.search(r'<TrackDuration>([^<]+)</TrackDuration>', resp)
         rel_time = re.search(r'<RelTime>([^<]+)</RelTime>', resp)
         dur = track_dur.group(1) if track_dur else "未知"
         pos = rel_time.group(1) if rel_time else "未知"
     except Exception:
-        dur, pos = "未知", "未知"
+        pass
+
+    state_desc = {
+        "PLAYING": "▶️ 正在播放",
+        "PAUSED_PLAYBACK": "⏸️ 已暂停",
+        "TRANSITIONING": "⏳ 缓冲加载中...",
+        "STOPPED": "⏹️ 已停止"
+    }.get(play_state, play_state)
 
     print("==================================================")
     print(f"📺 正在投屏: {state.get('title')}")
     print(f"📡 目标设备: {state.get('device', {}).get('name')} ({state.get('device', {}).get('ip')})")
+    print(f"📊 运行状态: {state_desc}")
     print(f"⏱️ 播放进度: {pos} / {dur}")
     print("==================================================")
 
