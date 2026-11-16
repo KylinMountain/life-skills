@@ -10,6 +10,7 @@
 | :--- | :--- | :--- |
 | **[`huavod-downloader`](./skills/huavod-downloader/)** | 流媒体/HLS 高清视频与剧集自动化检索、防验证解析、16 线程并发下载与 MP4 混流封装 | “我想看凡人修仙传动漫最新一集”<br>“帮我搜一下电影《希望》”<br>“把这个视频链接下载到本地” |
 | **[`media-cast`](./skills/media-cast/)** | 局域网智能电视与投影仪自动发现（DLNA/UPnP），本地高速流媒体中继与大屏硬解播放控制 | “把刚才下载的视频投屏到电视”<br>“扫描家里有哪些投屏设备”<br>“暂停 / 继续 / 停止投屏” |
+| **[`nanjing-home-sales`](./skills/nanjing-home-sales/)** | 南京二手房历史签约记录查询、价格遮罩原文保留与学区文件核对 | “查立贤小学范围内小区最近一年成交记录”<br>“查北苑一村的成交日期、面积和价格” |
 
 ---
 
@@ -64,7 +65,8 @@ tv-cast --stop     # 停止投屏
 life-skills/
 ├── skills/
 │   ├── huavod-downloader/  # 视频流解析与下载 Skill
-│   └── media-cast/         # 局域网智能投屏 Skill
+│   ├── media-cast/         # 局域网智能投屏 Skill
+│   └── nanjing-home-sales/ # 南京成交记录与学区核对 Skill
 ├── install.sh              # 环境初始化与依赖配置脚本
 └── README.md
 ```

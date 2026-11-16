@@ -15,3 +15,6 @@ huavod_cookie_*
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Isolated Android research environment (SDK, APKs, captures)
+.local/
