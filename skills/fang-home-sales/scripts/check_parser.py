@@ -31,8 +31,8 @@ from urllib.parse import urlencode, parse_qs, urlsplit
 material = {'prefix_hex': (b'n' * 32).hex(), 'suffix_hex': (b'k' * 64).hex()}
 for city in ['北京', '上海']:
     session = {'url': 'https://soufunappesf.3g.fang.com/http/sf2014.jsp?' + urlencode([('city', city), ('keyword', '测试小区'), ('messagename', 'GetDealList'), ('page', '1'), ('pagesize', '20'), ('wirelesscode', 'placeholder')]), 'request_headers': {'p-v-t': '1000000000000', 'p-v-c': 'placeholder'}}
-    first_url, first_headers = signed_request(session, material, 1)
-    second_url, second_headers = signed_request(session, material, 2)
+    first_url, first_headers = signed_request(session, material, 1, '测试小区')
+    second_url, second_headers = signed_request(session, material, 2, '测试小区')
     first, second = parse_qs(urlsplit(first_url).query), parse_qs(urlsplit(second_url).query)
     assert first['city'] == second['city'] == [city]
     assert first['keyword'] == second['keyword'] == ['测试小区']
@@ -41,3 +41,42 @@ for city in ['北京', '上海']:
     assert first_headers['p-v-c'] != second_headers['p-v-c']
     assert session['request_headers']['p-v-c'] == 'placeholder'
 print('City and filter preservation checks passed')
+
+# Explicit community scope is required before any request can be built.
+import copy
+for keyword, requested, page_size in [('', '测试小区', '20'), ('测试小区', '其他小区', '20'), ('测试小区', '测试小区', '100')]:
+    scoped = copy.deepcopy(session)
+    scoped['url'] = 'https://soufunappesf.3g.fang.com/http/sf2014.jsp?' + urlencode([('city', '北京'), ('keyword', keyword), ('messagename', 'GetDealList'), ('page', '1'), ('pagesize', page_size), ('wirelesscode', 'placeholder')])
+    try:
+        signed_request(scoped, material, 1, requested)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Expanded or ambiguous query scope must be rejected')
+print('Community scope and page-size checks passed')
+
+# Check cross-process exclusion and throttling across successive community runs.
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+import fetch_app_pages as client
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    env = os.environ.copy()
+    env['TMPDIR'] = temp_dir
+    env['PYTHONPATH'] = str(Path(__file__).resolve().parent)
+    with patch.object(client.tempfile, 'gettempdir', return_value=temp_dir):
+        with client.serial_queries():
+            child = subprocess.run([sys.executable, '-B', '-c', 'from fetch_app_pages import serial_queries\nwith serial_queries():\n print("unexpected")'], env=env, capture_output=True, text=True)
+            assert child.returncode != 0 and '已有房天下查询' in child.stderr
+        with patch.object(client.time, 'time', side_effect=[100.0, 101.0, 105.0, 106.0, 110.0]), patch.object(client.time, 'sleep') as sleep:
+            with client.serial_queries() as wait:
+                wait()
+                wait()
+            with client.serial_queries() as wait:
+                wait()
+            assert [call.args[0] for call in sleep.call_args_list] == [4.0, 4.0]
+print('Cross-process exclusion and cross-run throttle checks passed')

@@ -19,12 +19,13 @@
 
 ```sh
 python3 scripts/fetch_app_pages.py \
+  --community '用户指定的小区完整名称' \
   --session-file /private/local/session.json \
   --material-file /private/local/signing-material.json \
   --output-dir /private/local/result --page 1 --pages 2
 ```
 
-路径为参数示例。仅依赖Python标准库和curl。默认2页，单次最多10页；输出各页XML和records.json。认证失败、响应异常或记录ID重复时立即停止，不循环重试。会话失效后重新通过正常客户端获取并核对。
+路径为参数示例。仅依赖Python标准库和curl。单次仅一个明确小区；--community须与会话keyword一致，空keyword或仅区/城市筛选会被拒绝。每页最多20条，默认2页，单次最多10页；输出各页XML和records.json。CLI通过跨进程锁确保只有一个查询实例，跨页和跨小区相邻请求至少间隔5秒。不要在外部绕过工具并发限制。认证失败、限流、验证码、响应异常或记录ID重复时立即停止整个批次，不自动重试或继续下一小区。会话失效后重新通过正常客户端获取并核对。
 
 会话头、设备标识、签名材料、代理私钥和临时抓包留在私有忽略目录，不放Git或交付包。不得将真实账号会话自动用于此未登录测试工具。
 
