@@ -1,42 +1,21 @@
-# 房天下 Android 成交请求与分页实测
+# App 成交查询与分页
 
-2026-11-16，在独立 Google ARM Android 11 / API30 中运行官方入口下载的房天下9.139.2（com.soufun.app），未登录账号。用户明确同意在该临时设备接受协议、观察请求、提取并仅在本地保存签名初始化材料及验证分页。证据不适用于其他账号、设备或未来版本的授权。
+适用接口：GET `https://soufunappesf.3g.fang.com/http/sf2014.jsp`，`messagename=GetDealList`。协议适用范围为房天下Android 9.139.2的已授权未登录测试会话；其他版本和新会话需重新核对。
 
-## 实际入口与参数
+## 会话与签名
 
-GET `https://soufunappesf.3g.fang.com/http/sf2014.jsp`
+使用正常客户端取得目标查询的实际url和request_headers，保存到私有本地会话JSON。查询参数包含city、comarea、district、keyword、page、pagesize、wirelesscode。保留实际大小写、顺序、编码和筛选范围，不把其他入口的参数直接套用。
 
-本次北苑一村实际参数依次为：city=南京、comarea=月苑、district=玄武、keyword=北苑一村、messagename=GetDealList、page=1、pagesize=20、wirelesscode=客户端计算值。保持大小写、顺序与原始URL编码；不要把另一个全市入口 soufunapp.3g.fang.com/http/sfservice.jsp 的请求直接套过来。具体结构见 evidence/app-request-shape.json，只有头名称，没有认证/设备值。
+签名材料JSON有prefix_hex与suffix_hex两个十六进制字段，对应32字节初始化段N与64字节派生段K。材料不随Skill分发。仅使用用户已明确授权的设备与材料；缺失时不得猜密钥、读取真实手机或硬编码捕获值。需要提取时，先明确取得对设备、材料、本地保存和用途的授权。
 
-## 已验证的签名计算
+令Q为保持原顺序及百分号编码、移除wirelesscode后的ASCII query串，T为会话请求头p-v-t：
 
-从 APK 的 libSouFunSec.so 定位 SouFunSec.getSec、getVerify 及 MD5 计算；在独立测试进程中只读核对初始化状态。定义：
+- `W = uppercase_hex(MD5(Q || N || K))`，写入wirelesscode。
+- `C = uppercase_hex(MD5(T || K || ASCII(W)))`，写入请求头p-v-c。
 
-- Q：保持原顺序和百分号编码、移除wirelesscode后的ASCII query参数串；改变page后重新组成Q。
-- N：本次客户端初始化段，32字节。
-- K：本次原生库派生段，64字节。
-- T：已有请求头p-v-t的时间戳字符串。
-- W：`uppercase_hex(MD5(Q || N || K))`，作为query中的wirelesscode。
-- C：`uppercase_hex(MD5(T || K || ASCII(W)))`，作为请求头p-v-c。
+`||`为字节拼接，不加分隔符。改变page后重算W和C，不先URL解码Q。其余头沿用获准使用的会话；p-v-h、wirelessCheckCode等的独立生成及有效期没有通用保证。此工具不能替代正常客户端建立全新会话。
 
-`||`是字节拼接，不加分隔符。该公式在本地复现已捕获北苑一村请求的两个校验值，并通过实际第一页、第二页请求验证。Q本身已是ASCII百分号编码串，不能先URL解码再签名。N/K的值未写入仓库、交付包或聊天，不能用随意常量替代。
-
-这不是完整的全新会话生成方案：p-v-h、wirelessCheckCode等其余头沿用该授权测试会话，尚未独立还原其构造、有效期和必需性；初始化段的跨设备/版本稳定性未验证。不要把“本会话分页成功”夸大成完全不需要App、长期通用或所有版本通用。
-
-## 分页验证结果
-
-早期仅改page=2复用原wirelesscode：HTTP412/MD5验证失败。重算wirelesscode但沿用原p-v-c：HTTP412/invalid request；移除三项p-v头也未成功。按上述规则同时重算W和C后：
-
-| 页 | HTTP | 记录数 | 首条日期 | 末条日期 |
-|---|---|---|---|---|
-| 1 | 200 | 20 | 2026-10-11 | 2026-02-04 |
-| 2 | 200 | 20 | 2026-01-31 | 2025-06-01 |
-
-两页40个houseid无重复，响应声明count=161；未读取全部161条。证据见 evidence/app-beiyuan-page1.xml、app-beiyuan-page2.xml、app-pagination-verification.json。XML证据仅摘取count/keywordtype/hit，不改写记录值；请求会话与签名材料不在这些文件中。
-
-## 查询工具
-
-脚本只依赖Python标准库与curl，且仅支持已验证GetDealList入口。使用已明确获准使用的本地未登录测试会话JSON（url/request_headers）与本地材料JSON（prefix_hex/suffix_hex）：
+## 执行
 
 ```sh
 python3 scripts/fetch_app_pages.py \
@@ -45,18 +24,25 @@ python3 scripts/fetch_app_pages.py \
   --output-dir /private/local/result --page 1 --pages 2
 ```
 
-路径是参数示例，不是本包内置文件。默认只查2页，单次最多10页；认证失败、响应异常、ID重复即停止，不无限重试。输出XML与records.json只含响应数据，不导出请求认证值。会话可能失效，不能靠重复重放来恢复；需重新用正常客户端捕获并核验。初始化材料缺失时不要猜密钥或读取真实手机；如需重新提取，先明确取得用户对该设备、材料、本地保存及用途的授权。将材料、会话、代理私钥仅放私有忽略目录。
+路径为参数示例。仅依赖Python标准库和curl。默认2页，单次最多10页；输出各页XML和records.json。认证失败、响应异常或记录ID重复时立即停止，不循环重试。会话失效后重新通过正常客户端获取并核对。
 
-## 字段和价格限制
+会话头、设备标识、签名材料、代理私钥和临时抓包留在私有忽略目录，不放Git或交付包。不得将真实账号会话自动用于此未登录测试工具。
 
-`hit`包含houseid、projcode、projname、inserttime、buildarea、room、hall、forwardstr、floor、totalfloor、dealmoney、avgprice、companyname。inserttime与本次界面“签约时间”一致；不是据此证实官方交易日期。
+## 响应字段
 
-首条72.87㎡、2026-10-11，页面为`7**万`，API返回dealmoney=`73`、avgprice=`10155`。第二条47.27㎡、2026-10-08，返回`76`和`16289`。以页面“万”的单位解释，首条73万元除面积约10017.84，和返回10155不一致；按单价乘面积约74万元。第二条亦约77万元而原字段为76。原因未验证，不得自动加1、用单价反推修复或称为真实精确成交价。
+XML的hits/count是平台声明的当前查询总数，hit是逐条记录。用`python3 scripts/parse_app_sales.py response.xml`离线提取。
 
-主表仍按用户要求保留页面价格遮罩原文；API数值仅作为明确标注的未核验附加字段，不能自动替换遮罩。scripts/parse_app_sales.py原样保留XML字段并标记unmasked_unverified，拒绝把认证错误当成记录。未登录页面显示“登录查看成交价”，见evidence/app-beiyuan-masked.png；登录后与详情页数据未验证。
+| 字段 | 使用方式 |
+|---|---|
+| houseid | 记录标识，用于页内和页间重复检查 |
+| projcode / projname | 小区代码 / 名称 |
+| inserttime | 平台列表日期；与界面“签约时间”核对后展示 |
+| buildarea | 面积，与界面核对单位 |
+| room / hall | 室 / 厅 |
+| forwardstr / floor / totalfloor | 朝向 / 楼层分段 / 总层数 |
+| dealmoney / avgprice | 原样保留的金额 / 单价样式字段，空值记缺失 |
+| companyname | 平台来源标签，不能当作独立核验结论 |
 
-## 数据来源与覆盖范围
+API数值可能与总价、面积、单价之间的计算不一致。分别保留原字段并标注未核验，不自动加减金额或反推“正确价格”。用户要求遮罩原文时，不用API数值替换页面遮罩。作图使用哪个单价字段、单位与缺失处理，必须明确说明。
 
-本次北苑一村两页40条的companyname均为“贝壳”。因此实际样本至少包括平台标注来源为贝壳的数据，不能说只有房天下自营成交；也未独立核实贝壳原始记录或平台采集方式。companyname是记录来源标签，不等于完整的授权、同步频率或市场覆盖证明。
-
-没有证据表明房天下覆盖南京所有中介、所有个人交易或全部官方网签；count=161仅是当前查询返回总数，不是全市场成交量。接口有city参数，本次只实测南京，不能外推全国所有城市/全部二手房。做分析时明确“房天下可查询样本”，不据此计算全市场成交量或中介市占率。
+数据是房天下可查询样本，来源标签可能包括其他中介；不能据此宣称覆盖全部中介、全部个人交易或官方网签。城市参数不证明全国完整覆盖。
