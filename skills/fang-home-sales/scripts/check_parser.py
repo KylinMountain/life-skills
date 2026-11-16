@@ -24,3 +24,20 @@ except ValueError:
 else:
     raise AssertionError('Authentication failure must not become a transaction')
 print('Parser checks passed')
+
+from fetch_app_pages import signed_request
+from urllib.parse import urlencode, parse_qs, urlsplit
+# Synthetic sessions check that pagination preserves the selected city and filters.
+material = {'prefix_hex': (b'n' * 32).hex(), 'suffix_hex': (b'k' * 64).hex()}
+for city in ['北京', '上海']:
+    session = {'url': 'https://soufunappesf.3g.fang.com/http/sf2014.jsp?' + urlencode([('city', city), ('keyword', '测试小区'), ('messagename', 'GetDealList'), ('page', '1'), ('pagesize', '20'), ('wirelesscode', 'placeholder')]), 'request_headers': {'p-v-t': '1000000000000', 'p-v-c': 'placeholder'}}
+    first_url, first_headers = signed_request(session, material, 1)
+    second_url, second_headers = signed_request(session, material, 2)
+    first, second = parse_qs(urlsplit(first_url).query), parse_qs(urlsplit(second_url).query)
+    assert first['city'] == second['city'] == [city]
+    assert first['keyword'] == second['keyword'] == ['测试小区']
+    assert first['page'] == ['1'] and second['page'] == ['2']
+    assert first['wirelesscode'] != second['wirelesscode']
+    assert first_headers['p-v-c'] != second_headers['p-v-c']
+    assert session['request_headers']['p-v-c'] == 'placeholder'
+print('City and filter preservation checks passed')

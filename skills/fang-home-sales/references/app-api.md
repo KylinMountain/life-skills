@@ -4,7 +4,7 @@
 
 ## 会话与签名
 
-使用正常客户端取得目标查询的实际url和request_headers，保存到私有本地会话JSON。查询参数包含city、comarea、district、keyword、page、pagesize、wirelesscode。保留实际大小写、顺序、编码和筛选范围，不把其他入口的参数直接套用。
+使用正常客户端取得目标查询的实际url和request_headers，保存到私有本地会话JSON。查询参数包含city、comarea、district、keyword、page、pagesize、wirelesscode。city使用正常客户端在目标城市实际返回的值；先切换城市、再查询小区并捕获会话，同时保留该城市的相关请求头。城市编码、小区代码和学校范围不能跨城市复用。保留实际大小写、顺序、编码和筛选范围，不把其他入口的参数直接套用。
 
 签名材料JSON有prefix_hex与suffix_hex两个十六进制字段，对应32字节初始化段N与64字节派生段K。材料不随Skill分发。仅使用用户已明确授权的设备与材料；缺失时不得猜密钥、读取真实手机或硬编码捕获值。需要提取时，先明确取得对设备、材料、本地保存和用途的授权。
 
@@ -13,7 +13,7 @@
 - `W = uppercase_hex(MD5(Q || N || K))`，写入wirelesscode。
 - `C = uppercase_hex(MD5(T || K || ASCII(W)))`，写入请求头p-v-c。
 
-`||`为字节拼接，不加分隔符。改变page后重算W和C，不先URL解码Q。其余头沿用获准使用的会话；p-v-h、wirelessCheckCode等的独立生成及有效期没有通用保证。此工具不能替代正常客户端建立全新会话。
+`||`为字节拼接，不加分隔符。改变page后重算W和C，不先URL解码Q。其余头沿用获准使用的会话；p-v-h、wirelessCheckCode等的独立生成及有效期没有通用保证。此工具不能替代正常客户端建立全新会话，也不保证每个城市都开放同一接口。
 
 ## 执行
 
