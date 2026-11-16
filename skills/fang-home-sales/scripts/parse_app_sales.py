@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 def parse(text):
     root = ET.fromstring(text)
-    if root.tag != 'hits' or root.find('hit') is None:
+    if root.tag != 'hits' or (root.find('hit') is None and root.findtext('count') != '0'):
         raise ValueError('不是含成交记录的 hits XML，可能是认证失败或空响应')
     rows = []
     for hit in root.findall('hit'):

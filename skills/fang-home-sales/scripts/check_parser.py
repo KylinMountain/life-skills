@@ -23,6 +23,13 @@ except ValueError:
     pass
 else:
     raise AssertionError('Authentication failure must not become a transaction')
+assert parse_app('<hits><count>0</count></hits>') == {'declared_count_raw': '0', 'records': []}
+try:
+    parse_app('<hits><count>20</count></hits>')
+except ValueError:
+    pass
+else:
+    raise AssertionError('Missing nonempty records must not become an empty success')
 print('Parser checks passed')
 
 from fetch_app_pages import signed_request
