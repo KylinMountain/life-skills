@@ -75,6 +75,8 @@ def discover_dlna_devices(timeout=2.0):
         dev = parse_device_description(loc)
         if dev:
             devices.append(dev)
+    # 按 IP 和名称稳定排序，确保序号 1, 2, 3 永久一致不变
+    devices.sort(key=lambda d: (d.get("ip", ""), d.get("name", "")))
     return devices
 
 def parse_device_description(loc_url):
@@ -91,6 +93,15 @@ def parse_device_description(loc_url):
 
         mfg_m = re.search(r'<manufacturer>([^<]+)</manufacturer>', xml)
         mfg = mfg_m.group(1).strip() if mfg_m else ""
+
+        # 识别特色品牌（例如坚果投影仪等）
+        brand = ""
+        if "jianguo" in xml.lower() or "坚果" in xml:
+            brand = "坚果投影仪"
+            if "坚果" not in friendly_name:
+                friendly_name = f"{friendly_name} (坚果投影仪)"
+        elif "xiaomi" in xml.lower() or "小米" in xml:
+            brand = "小米"
 
         # 提取 AVTransport controlURL
         av_m = re.search(r'<serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>.*?<controlURL>([^<]+)</controlURL>', xml, re.DOTALL)
@@ -114,6 +125,7 @@ def parse_device_description(loc_url):
             "name": friendly_name,
             "model": model,
             "manufacturer": mfg,
+            "brand": brand,
             "ip": parsed_loc.hostname,
             "location": loc_url,
             "av_control_url": full_url(control_sub),
@@ -593,24 +605,54 @@ def main():
 
     target_dev = None
     if args.device:
-        for d in devices:
-            if args.device.lower() in d["name"].lower() or args.device == d["ip"]:
-                target_dev = d
-                break
-        if not target_dev:
-            print(f"[✗] 未找到匹配 '{args.device}' 的设备。可用设备:", file=sys.stderr)
+        # 1. 尝试纯数字序号 (例如 -d 1, -d 2, -d 3...)
+        if args.device.isdigit():
+            idx = int(args.device)
+            if 1 <= idx <= len(devices):
+                target_dev = devices[idx - 1]
+            else:
+                print(f"[✗] 序号 '{args.device}' 超出范围 (可用序号: 1-{len(devices)})", file=sys.stderr)
+                sys.exit(1)
+        else:
+            q = args.device.strip().lower()
             for d in devices:
-                print(f"  - {d['name']} ({d['ip']})", file=sys.stderr)
-            sys.exit(1)
+                search_text = f"{d['name']} {d['ip']} {d.get('model','')} {d.get('manufacturer','')} {d.get('brand','')}".lower()
+                if q in search_text:
+                    target_dev = d
+                    break
+                # 针对坚果 / 投影仪的别名支持
+                if q in ["坚果", "jmgo", "投影", "投影仪"] and ("jianguo" in search_text or "happycast" in search_text or "w6" in search_text):
+                    target_dev = d
+                    break
+            if not target_dev:
+                print(f"[✗] 未找到匹配 '{args.device}' 的设备。可用设备:", file=sys.stderr)
+                for idx, d in enumerate(devices, 1):
+                    mfg_info = f" ({d['manufacturer']})" if d['manufacturer'] else ""
+                    print(f"  [{idx}] {d['name']}{mfg_info} - IP: {d['ip']}", file=sys.stderr)
+                sys.exit(1)
     else:
         # 仅有 1 台设备时自动选中，多台时列出供选择
         if len(devices) == 1:
             target_dev = devices[0]
         else:
-            print(f"[!] 发现多台设备，请使用 -d 指定目标设备:")
-            for d in devices:
-                print(f"  - {d['name']} ({d['ip']})")
-            sys.exit(1)
+            print(f"\n==================================================")
+            print(f"📺 发现多台可用投屏大屏，请选择:")
+            print(f"==================================================")
+            for idx, d in enumerate(devices, 1):
+                mfg_info = f" ({d['manufacturer']})" if d['manufacturer'] else ""
+                print(f"[{idx}] {d['name']}{mfg_info} - IP: {d['ip']}")
+            print(f"==================================================")
+            if sys.stdin.isatty():
+                try:
+                    choice = input(f"[?] 请输入目标设备序号 (1-{len(devices)}): ").strip()
+                    if choice.isdigit() and 1 <= int(choice) <= len(devices):
+                        target_dev = devices[int(choice) - 1]
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    sys.exit(0)
+            if not target_dev:
+                print(f"[!] 请使用 -d 指定目标设备序号或名称，例如: -d 1 或 -d \"坚果\"", file=sys.stderr)
+                sys.exit(1)
 
     print(f"[*] 准备投屏到设备: {target_dev['name']} ({target_dev['ip']}) ...")
     try:
